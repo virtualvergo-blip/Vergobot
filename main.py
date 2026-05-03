@@ -68,9 +68,20 @@ async def main():
     await start_listener(client)
     
     # Start the client
-    if os.getenv("TELEGRAM_SESSION_STRING"):
-        await client.start()
+    SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
+    if SESSION_STRING:
+        # Di Railway/server: gunakan connect() + validasi session.
+        # JANGAN pakai client.start() tanpa phone — jika session expired
+        # Telethon akan minta input interaktif yang crash di environment tanpa terminal.
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError(
+                "TELEGRAM_SESSION_STRING tidak valid atau sudah expired!\n"
+                "Jalankan generate_session.py di lokal untuk generate session baru,\n"
+                "lalu update env var TELEGRAM_SESSION_STRING di Railway."
+            )
     else:
+        # Lokal: login interaktif via nomor HP
         await client.start(phone=PHONE)
     
     print("[Main] Telegram client connected")
