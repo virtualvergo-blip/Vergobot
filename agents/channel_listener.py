@@ -141,7 +141,8 @@ async def _handle_signal_call(text: str, source: str):
     )
 
     if is_new:
-        await send_new_call_alert(symbol, addr, token_data, source, parsed)
+        # FIX: send_new_call_alert hanya menerima 4 argumen, parsed sudah di-merge ke token_data
+        await send_new_call_alert(symbol, addr, token_data, source)
         await start_monitoring(addr, token_data)
     else:
         print(f"[Listener] {symbol} already in DB — skipping fresh monitor")
