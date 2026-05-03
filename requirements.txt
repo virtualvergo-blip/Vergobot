@@ -1,0 +1,22 @@
+# Telegram
+telethon==1.36.0
+
+# HTTP
+aiohttp==3.10.5
+
+# AI
+groq==0.11.0
+
+# Database
+aiosqlite==0.20.0
+
+# Data processing
+pandas==2.2.2
+numpy==2.1.1
+
+# Scheduling & env
+python-dotenv==1.0.1
+apscheduler==3.10.4
+pytz==2024.2
+
+
