@@ -63,16 +63,14 @@ async def main():
     
     # Create Telethon client
     client = await create_client()
-    
-    # Register message handlers
-    await start_listener(client)
-    
-    # Start the client
+
+    # ─── PENTING: Connect/authorize DULU sebelum start_listener ───
+    # start_listener memanggil client.get_entity() untuk resolve channel.
+    # get_entity() butuh koneksi aktif — kalau belum connect, semua channel
+    # gagal di-resolve, resolved=[], dan handler NewMessage tidak pernah
+    # menangkap pesan apapun dari signal channel.
     SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
     if SESSION_STRING:
-        # Di Railway/server: gunakan connect() + validasi session.
-        # JANGAN pakai client.start() tanpa phone — jika session expired
-        # Telethon akan minta input interaktif yang crash di environment tanpa terminal.
         await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError(
@@ -80,11 +78,16 @@ async def main():
                 "Jalankan generate_session.py di lokal untuk generate session baru,\n"
                 "lalu update env var TELEGRAM_SESSION_STRING di Railway."
             )
+        print("[Main] Telegram authorized via session string ✓")
     else:
-        # Lokal: login interaktif via nomor HP
         await client.start(phone=PHONE)
-    
-    print("[Main] Telegram client connected")
+        print("[Main] Telegram authorized via phone ✓")
+
+    # ─── Baru setelah connect: register handlers ───
+    # get_entity() di start_listener butuh client yang sudah authorized
+    await start_listener(client)
+
+    print("[Main] Telegram client connected + handlers registered")
     
     # Start health check server (required for Railway)
     await health_check_server()
