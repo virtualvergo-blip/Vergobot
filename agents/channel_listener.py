@@ -55,8 +55,11 @@ async def start_listener(client: TelegramClient):
             print("[Listener] Gagal resolve " + ch + ": " + str(e))
 
     if not resolved:
-        print("[Listener] Tidak ada channel yang berhasil di-resolve.")
+        print("[Listener] ⚠️  Tidak ada channel yang berhasil di-resolve.")
+        print("[Listener] Pastikan bot sudah join channel dan session valid.")
         return
+
+    print(f"[Listener] ✅ Resolved {len(resolved)}/{len(SIGNAL_CHANNELS)} channel(s)")
 
     @client.on(events.NewMessage(chats=resolved))
     async def handler(event):
