@@ -116,8 +116,9 @@ SNIPER_RE      = re.compile(r'sniper[:\s]+(\d+)', re.IGNORECASE)
 # Bundle: "Bundle: 2 buy 10.5% with 4 SOL"
 BUNDLE_RE      = re.compile(r'bundle[:\s]+(\d+)\s*buy\s*(\d+(?:\.\d+)?)\s*%', re.IGNORECASE)
 
-# Token name+symbol: "Mini Me (MINIME)" or "💊 Mini Me (MINIME)"
-NAME_SYMBOL_RE = re.compile(r'(?:[\U00010000-\U0010ffff]|\S+)?\s*(.+?)\s+\(([A-Z0-9]{2,12})\)')
+# Token name+symbol: "Mini Me (MINIME)", "💊 Mini Me (MINIME)", "Tung Tung Sahur (TripleT)"
+# PERBAIKAN: [A-Za-z0-9] agar tangkap mixed case seperti "TripleT", bukan hanya uppercase
+NAME_SYMBOL_RE = re.compile(r'(.+?)\s+\(([A-Za-z0-9]{2,15})\)')
 
 # GMGN URL
 GMGN_URL_RE    = re.compile(r'https?://gmgn\.ai/\S+', re.IGNORECASE)
@@ -128,6 +129,9 @@ DEV_HOLD_RE    = re.compile(r'dev[:\s]+.*hold', re.IGNORECASE)
 
 # Dex paid
 DEX_PAID_RE    = re.compile(r'dex paid[:\s]*(✅|❌|yes|no)', re.IGNORECASE)
+
+# Within N minutes/days — support: "within 13m", "within 68days", "within 5min"
+WITHIN_RE      = re.compile(r'within\s+(\d+)\s*(m|min|minutes?|d|days?)', re.IGNORECASE)
 
 
 # ─────────────────────────────────────────────
@@ -229,10 +233,14 @@ def extract_signal_call(text: str) -> Optional[ParsedSignalCall]:
     result = ParsedSignalCall(contract_address=contract, raw_text=text)
 
     # ── Token name + symbol
+    # NAME_SYMBOL_RE kini tangkap mixed case. Strip emoji/karakter prefix dari nama.
     name_match = NAME_SYMBOL_RE.search(text)
     if name_match:
-        result.token_name   = name_match.group(1).strip()
-        result.token_symbol = name_match.group(2).strip()
+        raw_name = name_match.group(1).strip()
+        # Hapus emoji dan karakter khusus di awal nama (mis. "💊 Trollina" → "Trollina")
+        raw_name = re.sub(r'^[^\w]+', '', raw_name, flags=re.UNICODE).strip()
+        result.token_name   = raw_name
+        result.token_symbol = name_match.group(2).upper()
 
     # ── Market cap
     mc_match = re.search(r'mc[:\s]+(\d+(?:\.\d+)?)\s*([KMB])', text, re.IGNORECASE)
@@ -311,21 +319,23 @@ def extract_update(text: str) -> ParsedUpdate:
     result = ParsedUpdate(raw_text=text)
 
     # ── Token name + symbol
-    # 1. From "Update: TokenName (SYM)" line
+    # 1. From "Update: TokenName (SYM)" line — tangkap seluruh baris setelah "Update:"
     update_line = re.search(r'update[:\s]+(.+?)(?:\n|$)', text, re.IGNORECASE)
     if update_line:
-        name_match = NAME_SYMBOL_RE.search(update_line.group(1))
+        line_text = update_line.group(1).strip()
+        name_match = NAME_SYMBOL_RE.search(line_text)
         if name_match:
+            # name_match.group(1) = full name, group(2) = symbol (possibly mixed case)
             result.token_name   = name_match.group(1).strip()
-            result.token_symbol = name_match.group(2).strip()
+            result.token_symbol = name_match.group(2).upper()
         else:
-            result.token_name = update_line.group(1).strip()
+            result.token_name = line_text
 
-    # 2. "$SYMBOL" pattern anywhere in message (e.g. "$BUTT 6.2x...")
+    # 2. "$SYMBOL" pattern anywhere in message (e.g. "$TRIPLET 279x...")
     if not result.token_symbol:
-        dollar_sym = re.search(r'\$([A-Z]{2,12})\b', text)
+        dollar_sym = re.search(r'\$([A-Za-z0-9]{2,15})\b', text)
         if dollar_sym:
-            result.token_symbol = dollar_sym.group(1)
+            result.token_symbol = dollar_sym.group(1).upper()
 
     # ── Multiplier: "6.2x(9.6x from PREMIUM)"
     mult_full = re.search(
@@ -341,19 +351,25 @@ def extract_update(text: str) -> ParsedUpdate:
         if mult_match:
             result.multiplier = float(mult_match.group(1))
 
-    # ── MC from → to: "From 31.1K ➡ 193.6K" or "From 45K -> 382K"
+    # ── MC from → to: "From 31.1K ➡ 193.6K", "From 28.6K ↗️ 7.98m", "From 45K -> 382K"
+    # \ufe0f = variation selector yang sering ikut emoji panah (mis. ↗️), harus di-skip
     mc_range = re.search(
-        r'from\s+(\d+(?:\.\d+)?)\s*([KMB]?)\s*(?:➡|→|->|▶|↗|⬆)\s*(\d+(?:\.\d+)?)\s*([KMB]?)',
+        r'from\s+(\d+(?:\.\d+)?)\s*([KMB]?)\s*(?:➡|→|->|▶|↗|⬆)\ufe0f?\s*(\d+(?:\.\d+)?)\s*([KMBm]?)',
         text, re.IGNORECASE
     )
     if mc_range:
         result.mc_from = _parse_value(mc_range.group(1), mc_range.group(2))
         result.mc_to   = _parse_value(mc_range.group(3), mc_range.group(4))
 
-    # ── Within N minutes
+    # ── Within N minutes (atau days, dikonversi ke menit)
     within_match = WITHIN_RE.search(text)
     if within_match:
-        result.within_minutes = int(within_match.group(1))
+        val  = int(within_match.group(1))
+        unit = within_match.group(2).lower()
+        if unit.startswith('d'):
+            result.within_minutes = val * 1440  # hari → menit
+        else:
+            result.within_minutes = val
 
     # ── Contract address (kadang ada di footer update)
     evm = EVM_ADDRESS_RE.search(text)
