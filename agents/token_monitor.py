@@ -67,7 +67,7 @@ async def _monitor_loop(contract_address: str, initial_token_info: dict):
 
             data = await fetch_token_data(contract_address, chain)
             if not data:
-                await asyncio.sleep(5)
+                await asyncio.sleep(15)
                 continue
 
             # Determine timeframe label
@@ -144,7 +144,7 @@ async def _monitor_loop(contract_address: str, initial_token_info: dict):
                         )
                         prediction_sent = True
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(15)  # 15s — cukup untuk catch pump cepat, tidak kena rate limit GMGN
 
         # End of session — save pattern
         final_history = await get_price_history(contract_address, limit=1000)
