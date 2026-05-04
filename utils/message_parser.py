@@ -72,18 +72,16 @@ UPDATE_KEYWORDS = [
 ]
 
 # Promo/ad indicators — no contract address, just marketing
+# CATATAN: jangan terlalu agresif — channel pumpfunnevadie sering menyebut
+# "PREMIUM" dalam konteks update multiplier (bukan iklan)
 PROMO_KEYWORDS = [
-    r"\bjoin\b.*\bpremium\b",
-    r"\bsubscribe\b",
-    r"\bvip\b",
-    r"\bpromo\b",
-    r"\bdiscount\b",
+    r"\bjoin\b.*\bpremium\b.*\bchannel\b",  # harus ada "channel" supaya tidak false positive
+    r"\bsubscribe\b.*\bchannel\b",
+    r"\bvip\b.*\bmembership\b",
     r"\bsignal\b.*\bfree\b",
     r"\bclick here\b",
     r"\bt\.me/\+",           # invite link
-    r"\bour channel\b",
     r"\bfollow us\b",
-    r"note:.*premium",
     r"\bpaid group\b",
     r"\bwhitelist\b",
 ]
