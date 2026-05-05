@@ -1,3 +1,7 @@
+"""
+agents/channel_listener.py
+FIXED: Better logging, correct handler flow, immediate AI analysis on call.
+"""
 import os
 import asyncio
 from datetime import datetime
@@ -10,30 +14,29 @@ from utils.message_parser import (
     extract_signal_call, extract_update,
     ParsedSignalCall, ParsedUpdate,
 )
-from utils.data_fetcher import fetch_token_data, determine_chain
-from database.db_manager import upsert_token, update_prediction_outcome
+from utils.data_fetcher import fetch_token_data, determine_chain, fetch_full_analysis_bundle
+from database.db_manager import upsert_token, update_prediction_outcome_by_address, save_prediction
 from agents.token_monitor import start_monitoring, active_monitors
 from agents.notifier import (
-    send_new_call_alert, send_update_alert, send_error_alert
+    send_new_call_alert, send_update_alert, send_error_alert, send_prediction_alert
 )
+from agents.ai_analyzer import analyze_token_pattern
 
-API_ID         = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH       = os.getenv("TELEGRAM_API_HASH", "")
-PHONE          = os.getenv("TELEGRAM_PHONE", "")
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+PHONE = os.getenv("TELEGRAM_PHONE", "")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
 
 SIGNAL_CHANNELS_RAW = os.getenv("SIGNAL_CHANNELS", "")
-SIGNAL_CHANNELS     = [c.strip() for c in SIGNAL_CHANNELS_RAW.split(",") if c.strip()]
+SIGNAL_CHANNELS = [c.strip() for c in SIGNAL_CHANNELS_RAW.split(",") if c.strip()]
 
 processed_calls: set = set()
 MAX_RECENT = 1000
-
 
 async def create_client():
     if SESSION_STRING:
         return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     return TelegramClient("memeagent_session", API_ID, API_HASH)
-
 
 async def start_listener(client: TelegramClient):
     if not SIGNAL_CHANNELS:
@@ -42,9 +45,9 @@ async def start_listener(client: TelegramClient):
 
     print("[Listener] Watching " + str(len(SIGNAL_CHANNELS)) + " channel(s):")
     for ch in SIGNAL_CHANNELS:
-        print("  -> " + ch)
+        print(" -> " + ch)
 
-    # FIX: resolve entities dulu agar NewMessage filter bekerja
+    # Resolve entities
     resolved = []
     for ch in SIGNAL_CHANNELS:
         try:
@@ -55,7 +58,7 @@ async def start_listener(client: TelegramClient):
             print("[Listener] Gagal resolve " + ch + ": " + str(e))
 
     if not resolved:
-        print("[Listener] ⚠️  Tidak ada channel yang berhasil di-resolve.")
+        print("[Listener] ⚠️ Tidak ada channel yang berhasil di-resolve.")
         print("[Listener] Pastikan bot sudah join channel dan session valid.")
         return
 
@@ -68,25 +71,29 @@ async def start_listener(client: TelegramClient):
             if not text.strip():
                 return
 
-            chat    = await event.get_chat()
+            chat = await event.get_chat()
             ch_name = getattr(chat, "username", None) or getattr(chat, "title", "unknown")
-            src     = "@" + ch_name
+            src = "@" + ch_name
 
             msg_type = classify_message(text)
 
-            # Hanya proses SIGNAL_CALL — UPDATE dan PROMO diabaikan.
-            if msg_type.value != "SIGNAL_CALL":
-                return
-            print("\n[Listener] [" + msg_type.value + "] from " + src + ": " + text[:60].strip() + "...")
+            # LOG semua pesan untuk debugging
+            print(f"\n[Listener] 📨 [{msg_type.value}] from {src}")
+            print(f"[Listener] Content: {text[:120].replace(chr(10), ' | ')}...")
 
             if msg_type == MessageType.SIGNAL_CALL:
+                print(f"[Listener] 🎯 SIGNAL_CALL detected! Processing...")
                 await _handle_signal_call(text, src)
             elif msg_type == MessageType.UPDATE:
+                print(f"[Listener] 📈 UPDATE detected! Logging outcome...")
                 await _handle_update(text, src)
             elif msg_type == MessageType.PROMO:
-                print("[Listener] Promo/ad ignored")
+                print("[Listener] 🚫 PROMO/ADS ignored")
             else:
-                print("[Listener] Unknown message type ignored")
+                print("[Listener] ❓ Unknown message type ignored")
+                # Debug: show why it wasn't classified
+                if _has_contract_address(text):
+                    print("[Listener]    (Has CA but not recognized as CALL — check parser)")
 
         except Exception as e:
             print("[Listener] Handler error: " + str(e))
@@ -94,17 +101,16 @@ async def start_listener(client: TelegramClient):
 
     print("[Listener] Ready. Listening for calls...")
 
-
 async def _handle_signal_call(text: str, source: str):
     parsed = extract_signal_call(text)
     if not parsed:
         print("[Listener] SIGNAL_CALL tapi contract address tidak ditemukan")
         return
 
-    addr  = parsed.contract_address
+    addr = parsed.contract_address
     chain = determine_chain(addr)
 
-    print("[Listener] New call: " + str(parsed.token_symbol or "?") + " (" + addr[:8] + "...) chain=" + chain)
+    print(f"[Listener] 🆕 New call: {str(parsed.token_symbol or '?')} ({addr[:8]}...) chain={chain}")
 
     if addr in processed_calls:
         print("[Listener] Already processing " + addr[:8] + "...")
@@ -133,21 +139,75 @@ async def _handle_signal_call(text: str, source: str):
     )
 
     if is_new:
+        # Send new call alert
         await send_new_call_alert(symbol, addr, token_data, source)
+
+        # ── IMMEDIATE AI ANALYSIS ──
+        # Analyze token immediately when call comes in, not just at end of session
+        print(f"[Listener] 🤖 Running initial AI analysis for {symbol}...")
+        try:
+            bundle = await fetch_full_analysis_bundle(addr, chain)
+
+            initial_prediction = await analyze_token_pattern(
+                token_data=token_data,
+                price_history=[],  # No history yet
+                timeframe_stats={
+                    "snapshots": 0,
+                    "entry_price": token_data.get("price_usd", 0),
+                    "first_price": token_data.get("price_usd", 0),
+                    "current_price": token_data.get("price_usd", 0),
+                },
+                analysis_bundle=bundle,
+            )
+
+            if initial_prediction:
+                print(f"[Listener] 🧠 AI Prediction: {initial_prediction.get('prediction_type')} "
+                      f"| Confidence: {initial_prediction.get('confidence', 0):.2f}")
+
+                # Save prediction
+                pred_id = await save_prediction(
+                    contract_address=addr,
+                    prediction_type=initial_prediction.get("prediction_type", "UNKNOWN"),
+                    predicted_multiplier=initial_prediction.get("predicted_multiplier", 1.0),
+                    safe_tp_multiplier=initial_prediction.get("safe_tp_multiplier", 1.0),
+                    confidence=initial_prediction.get("confidence", 0),
+                    reasoning=initial_prediction.get("reasoning", ""),
+                    ai_raw=initial_prediction.get("ai_raw_response", ""),
+                )
+
+                # Send prediction alert immediately
+                await send_prediction_alert(
+                    symbol=symbol,
+                    contract_address=addr,
+                    token_data=token_data,
+                    prediction=initial_prediction,
+                    timeframe_stats={"snapshots": 0, "max_gain_pct": 0},
+                )
+                print(f"[Listener] ✅ Initial prediction alert sent for {symbol}")
+            else:
+                print(f"[Listener] ⚠️ AI analysis returned None for {symbol}")
+
+        except Exception as e:
+            print(f"[Listener] ⚠️ Initial AI analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Start monitoring (continues in background)
         await start_monitoring(addr, token_data)
     else:
         print("[Listener] " + symbol + " already in DB - skipping")
 
-
 async def _handle_update(text: str, source: str):
     parsed = extract_update(text)
 
-    mult    = parsed.multiplier
-    sym     = parsed.token_symbol or parsed.token_name or "?"
-    mins    = parsed.within_minutes
+    mult = parsed.multiplier
+    sym = parsed.token_symbol or parsed.token_name or "?"
+    mins = parsed.within_minutes
     mc_from = parsed.mc_from
-    mc_to   = parsed.mc_to
+    mc_to = parsed.mc_to
     premium = parsed.premium_multiplier
+
+    print(f"[Listener] 📈 Update: {sym} | {mult}x | MC: {mc_from}→{mc_to} | {mins}m")
 
     await send_update_alert(
         symbol=sym,
@@ -161,10 +221,9 @@ async def _handle_update(text: str, source: str):
 
     if parsed.contract_address and mult:
         addr = parsed.contract_address
-        if addr in active_monitors:
-            await update_prediction_outcome(addr, mult)
-            print("[Listener] Winrate updated for " + addr[:8] + ": actual " + str(mult) + "x")
-
+        # Update prediction outcome for learning
+        await update_prediction_outcome_by_address(addr, mult)
+        print("[Listener] Winrate updated for " + addr[:8] + ": actual " + str(mult) + "x")
 
 def _enrich_with_parsed(token_data: dict, parsed: ParsedSignalCall) -> dict:
     if parsed.token_name and not token_data.get("name"):
@@ -191,12 +250,15 @@ def _enrich_with_parsed(token_data: dict, parsed: ParsedSignalCall) -> dict:
         token_data["dex_url"] = parsed.gmgn_url
     return token_data
 
-
-def _fmt(val: Optional[float]) -> str:
-    if val is None:
-        return "?"
-    if val >= 1_000_000:
-        return str(round(val/1_000_000, 1)) + "M"
-    if val >= 1_000:
-        return str(round(val/1_000, 1)) + "K"
-    return str(int(val))
+def _has_contract_address(text: str) -> bool:
+    """Helper untuk debug."""
+    import re
+    SOL_ADDRESS_RE = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
+    EVM_ADDRESS_RE = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
+    if EVM_ADDRESS_RE.search(text):
+        return True
+    for match in SOL_ADDRESS_RE.finditer(text):
+        addr = match.group()
+        if len(addr) >= 32 and "http" not in addr:
+            return True
+    return False
