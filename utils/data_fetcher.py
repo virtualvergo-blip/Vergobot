@@ -40,6 +40,12 @@ DEXSCREENER_BASE = "https://api.dexscreener.com"
 
 _SESSION: Optional[aiohttp.ClientSession] = None
 
+# ─── Global GMGN rate limiter ───────────────────────────────────────────────
+# Max 2 concurrent gmgn-cli processes. Setiap token_monitor menjalankan banyak
+# call paralel — tanpa semaphore, 3 token × 9 call = 27 request/cycle → banned.
+_GMGN_SEM = asyncio.Semaphore(2)
+_GMGN_BAN_UNTIL: float = 0.0   # epoch seconds — tunggu sampai ban selesai
+
 
 async def _get_session() -> aiohttp.ClientSession:
     global _SESSION
@@ -64,46 +70,61 @@ async def _run_gmgn_cli(*args) -> Optional[Any]:
     env = os.environ.copy()
     env["GMGN_API_KEY"] = GMGN_API_KEY
 
-    # Windows: npm install -g membuat wrapper .cmd, bukan binary langsung.
-    # shutil.which() mencari gmgn-cli.cmd (Windows) atau gmgn-cli (Linux/Mac).
     cli_name = "gmgn-cli.cmd" if sys.platform == "win32" else "gmgn-cli"
     cli_path = shutil.which(cli_name) or shutil.which("gmgn-cli")
-
     if not cli_path:
         print("[gmgn-cli] NOT FOUND — pastikan sudah install: npm install -g gmgn-cli")
         return None
 
     cmd = [cli_path] + list(args) + ["--raw"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
 
-        if proc.returncode != 0:
-            err_msg = stderr.decode(errors="replace")[:300]
-            print(f"[gmgn-cli] returncode={proc.returncode} cmd={' '.join(cmd)}\n  stderr: {err_msg}")
+    async with _GMGN_SEM:
+        # Tunggu global ban selesai sebelum mengirim request
+        global _GMGN_BAN_UNTIL
+        now = time.time()
+        if _GMGN_BAN_UNTIL > now:
+            wait = _GMGN_BAN_UNTIL - now + 1
+            await asyncio.sleep(wait)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
+
+            if proc.returncode != 0:
+                err_msg = stderr.decode(errors="replace")
+                # Parse "~Xs remaining" dari pesan error GMGN untuk smart backoff
+                m = re.search(r"~(\d+)s remaining", err_msg)
+                if m:
+                    wait_s = int(m.group(1)) + 2
+                    _GMGN_BAN_UNTIL = time.time() + wait_s
+                    # Hanya print sekali per ban, bukan setiap retry
+                    if "RATE_LIMIT_BANNED" in err_msg:
+                        print(f"[gmgn-cli] BANNED ~{wait_s}s, pausing all calls")
+                    else:
+                        print(f"[gmgn-cli] Rate limited ~{wait_s}s")
+                else:
+                    short = err_msg[:200].strip()
+                    print(f"[gmgn-cli] returncode={proc.returncode}\n  {short}")
+                return None
+
+            raw = stdout.decode(errors="replace").strip()
+            if not raw:
+                return None
+            return json.loads(raw)
+
+        except asyncio.TimeoutError:
+            print(f"[gmgn-cli] Timeout cmd={args[0]} {args[1]}")
             return None
-
-        raw = stdout.decode(errors="replace").strip()
-        if not raw:
-            print(f"[gmgn-cli] Empty output for cmd: {' '.join(cmd)}")
+        except json.JSONDecodeError:
             return None
-
-        return json.loads(raw)
-
-    except asyncio.TimeoutError:
-        print(f"[gmgn-cli] Timeout (20s) cmd={' '.join(cmd)}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"[gmgn-cli] JSON parse error: {e} — output: {stdout.decode(errors='replace')[:200]}")
-        return None
-    except Exception as e:
-        print(f"[gmgn-cli] Error: {e}")
-        return None
+        except Exception as e:
+            print(f"[gmgn-cli] Error: {e}")
+            return None
 
 
 # ─────────────────────────────────────────────
@@ -433,6 +454,36 @@ async def dexscreener_token(contract_address: str) -> Optional[Dict]:
 # ─────────────────────────────────────────────
 # MAIN: Unified token data fetch
 # ─────────────────────────────────────────────
+async def fetch_price_only(contract_address: str, chain: str = "sol") -> Optional[Dict]:
+    """
+    Lightweight price fetch untuk polling loop (setiap 60s).
+    Hanya satu call: gmgn-cli token info — tidak ada pool/helius/dexscreener.
+    Fallback ke DexScreener jika GMGN tidak tersedia.
+    """
+    if GMGN_API_KEY:
+        data = await gmgn_token_info(contract_address, chain)
+        if data:
+            token = data.get("token") or data
+            price = _float(token.get("price") or token.get("price_usd"))
+            if price and price > 0:
+                return {
+                    "contract_address": contract_address,
+                    "chain":            chain,
+                    "price_usd":        price,
+                    "market_cap":       _float(token.get("market_cap") or token.get("marketCap")),
+                    "volume_24h":       _float(token.get("volume_24h") or token.get("volume")),
+                    "price_change_5m":  _float(token.get("price_change_5m") or token.get("change5m")),
+                    "liquidity_usd":    _float(token.get("liquidity")),
+                    "source":           "gmgn",
+                }
+
+    # DexScreener fallback
+    dex = await dexscreener_token(contract_address)
+    if dex and dex.get("price_usd"):
+        return dex
+    return None
+
+
 async def fetch_token_data(contract_address: str, chain: str = None) -> Optional[Dict]:
     """
     Fetch token data from best available source.
@@ -553,17 +604,14 @@ async def fetch_candles_all_resolutions(
     Fetch candles at all timeframes in parallel.
     Returns dict: { "1m": [...], "5m": [...], "15m": [...], "1h": [...] }
     """
+    # Sequential — rate limit GMGN sangat ketat untuk concurrent requests
     resolutions = ["1m", "5m", "15m", "1h"]
-    tasks = {
-        res: gmgn_kline(contract_address, chain, resolution=res, limit=100)
-        for res in resolutions
-    }
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     out: Dict[str, List[Dict]] = {}
-    for res, result in zip(tasks.keys(), results):
-        if isinstance(result, list) and result:
-            out[res] = result
-        else:
+    for res in resolutions:
+        try:
+            candles = await gmgn_kline(contract_address, chain, resolution=res, limit=100)
+            out[res] = candles if isinstance(candles, list) and candles else []
+        except Exception:
             out[res] = []
     return out
 
@@ -644,23 +692,20 @@ async def fetch_full_analysis_bundle(
     - token info, security, pool, holders, traders, candles (multi-res)
     - Helius supply + concentration
     """
-    tasks = {
-        "token_info": gmgn_token_info(contract_address, chain),
-        "security":   gmgn_security(contract_address, chain),
-        "pool":       gmgn_pool(contract_address, chain),
-        "holders":    gmgn_holders(contract_address, chain, limit=20),
-        "traders":    gmgn_traders(contract_address, chain, limit=20),
-        "candles":    fetch_candles_all_resolutions(contract_address, chain),
-    }
+    # Sequential bukan parallel — semaphore di _run_gmgn_cli tidak efektif
+    # kalau gather() start semua coroutine sekaligus sebelum masuk semaphore.
+    # Sequential call lebih lambat tapi tidak kena rate limit ban.
+    bundle: Dict[str, Any] = {}
+    bundle["token_info"] = await gmgn_token_info(contract_address, chain)
+    bundle["security"]   = await gmgn_security(contract_address, chain)
+    bundle["pool"]       = await gmgn_pool(contract_address, chain)
+    bundle["holders"]    = await gmgn_holders(contract_address, chain, limit=20)
+    bundle["traders"]    = await gmgn_traders(contract_address, chain, limit=20)
+    bundle["candles"]    = await fetch_candles_all_resolutions(contract_address, chain)
 
     if HELIUS_API_KEY and chain == "sol":
-        tasks["supply"]  = helius_token_supply(contract_address)
-        tasks["on_chain_holders"] = helius_largest_accounts(contract_address)
-
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-    bundle: Dict[str, Any] = {}
-    for key, result in zip(tasks.keys(), results):
-        bundle[key] = None if isinstance(result, Exception) else result
+        bundle["supply"]           = await helius_token_supply(contract_address)
+        bundle["on_chain_holders"] = await helius_largest_accounts(contract_address)
 
     # Build candle features
     if bundle.get("candles"):
