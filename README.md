@@ -1,188 +1,97 @@
-# 🤖 Meme Coin AI Agent
+# Vergobot Fixes — Bot Not Responding to Calls
 
-Agent AI yang memantau channel Telegram signal meme coin, mempelajari pola pump/dump, dan mengirim notifikasi prediksi otomatis.
-
-## 🏗 Arsitektur
-
+## Problem
+Bot successfully connected to Telegram and resolved `@pumpfunnevadie`, but **never detected any SIGNAL_CALL messages**. Log only showed:
 ```
-Telegram Channel Signal
-        ↓
-  Channel Listener (Telethon)
-        ↓
-  Extract Contract Address
-        ↓
-  Fetch Price Data (DexScreener FREE)
-        ↓
-  Start Multi-Timeframe Monitor (1s/5s/15s/30s/1m/5m/10m)
-        ↓
-  AI Analysis (Groq - Llama 3.3 70B - FREE)
-        ↓
-  Save Pattern ke SQLite
-        ↓
-  Send Alert → Telegram Bot → Anda
+[Listener] Ready. Listening for calls...
+```
+With no "New call detected" or processing logs.
+
+## Root Causes Found
+
+### 1. 🚨 CRITICAL: Message Parser Misclassified Calls as Updates
+**File:** `utils/message_parser.py`
+
+The `_is_update()` function was too aggressive:
+```python
+# OLD — WRONG: Any message with "6.2x" was classified as UPDATE
+if MULTIPLIER_RE.search(text) and WITHIN_RE.search(text):
+    return True  # ← Call messages also contain "1.5x" in PREMIUM notes!
 ```
 
-## ⚡ Tech Stack
+Call messages from `@pumpfunnevadie` contain:
+- `NOTE: In PREMIUM, the profit will be 1.5x --> 2x before public`
+- This triggered the multiplier regex → classified as UPDATE
+- Result: **All calls were ignored!**
 
-| Komponen | Tool | Biaya |
-|---|---|---|
-| AI Analysis | Groq (Llama 3.3 70B) | **Gratis** |
-| Price Data | DexScreener API | **Gratis** |
-| Channel Monitor | Telethon | **Gratis** |
-| Database | SQLite (local) | **Gratis** |
-| Hosting | Railway | ~$5/bulan |
+**Fix:** Complete rewrite of `classify_message()` with explicit detection:
+- **PROMO** first (ads, recaps, bonding messages) → ignored
+- **UPDATE** only if explicit patterns: `Update:`, `$SYM Nx from PREMIUM`, `From X ➡ Y within Z`, `has been bonded`
+- **SIGNAL_CALL** requires: contract address + call structure (MC:, Age:, Dev:, Dex Paid:, TH:, Sniper:, Bundle:, Chart:)
 
----
+### 2. 🐛 Missing `agents/bot_commands.py`
+**File:** `main.py` imports `start_polling` from `agents.bot_commands`, but the file didn't exist.
 
-## 🚀 Setup Step-by-Step
+**Fix:** Created complete `agents/bot_commands.py` with `/status`, `/tokens`, `/active`, `/help` commands.
 
-### 1. Telegram API Credentials
+### 3. 🐛 `fetch_price_only()` Missing `buys_5m`/`sells_5m`
+**File:** `utils/data_fetcher.py`
 
-1. Buka https://my.telegram.org/apps
-2. Login dengan nomor HP Anda
-3. Buat aplikasi baru → catat **API_ID** dan **API_HASH**
+`fetch_price_only()` (used in polling loop) didn't return `buys_5m`/`sells_5m`, so all snapshots saved with 0 buys/sells.
 
-### 2. Buat Telegram Bot
+**Fix:** Added `buys_5m` and `sells_5m` to GMGN and DexScreener responses.
 
-1. Chat `@BotFather` di Telegram
-2. Kirim `/newbot` → ikuti instruksi
-3. Catat **BOT_TOKEN**
-4. Chat `@userinfobot` → catat **YOUR_CHAT_ID**
+### 4. 🐛 `update_prediction_outcome()` Signature Mismatch
+**File:** `database/db_manager.py`
 
-### 3. Groq API Key (Gratis)
+`token_monitor.py` called `update_prediction_outcome(pred_id, outcome, final_mult)` (3 args) but function only accepted 2 args.
 
-1. Daftar di https://console.groq.com
-2. API Keys → Create → catat **GROQ_API_KEY**
-3. Free tier: 14,400 requests/hari (lebih dari cukup)
+**Fix:** Split into two functions:
+- `update_prediction_outcome(prediction_id, actual_multiplier)` — used by token_monitor
+- `update_prediction_outcome_by_address(contract_address, actual_multiplier)` — used by channel_listener for update messages
 
-### 4. Generate Session String (PENTING untuk Railway)
+### 5. 🐛 AI Analysis Only at End of Session
+**File:** `agents/token_monitor.py`
 
-Jalankan **secara lokal** sebelum deploy:
+AI analysis was only performed at the END of the monitoring session (30-60 min), not when the call first arrived.
 
-```bash
-# Clone/copy project ke komputer lokal
-pip install telethon python-dotenv
+**Fix:** Moved initial AI analysis to `channel_listener.py` — immediately analyzes and sends prediction alert when call is detected. End-of-session analysis in `token_monitor.py` continues for pattern learning.
 
-# Isi .env dulu dengan API_ID, API_HASH, TELEGRAM_PHONE
-cp .env.example .env
-nano .env
+## Files Changed
 
-# Generate session
-python generate_session.py
+| File | Action | Key Changes |
+|------|--------|-------------|
+| `utils/message_parser.py` | **Rewrite** | Explicit call vs update detection, promo filtering |
+| `agents/channel_listener.py` | **Fix** | Immediate AI analysis on call, better logging |
+| `agents/token_monitor.py` | **Fix** | Proper `update_prediction_outcome` call with pred_id |
+| `utils/data_fetcher.py` | **Fix** | `fetch_price_only` returns buys/sells |
+| `database/db_manager.py` | **Fix** | Two variants of `update_prediction_outcome` |
+| `agents/bot_commands.py` | **New** | Complete bot command handler |
+
+## Message Classification Results
+
+Tested against your uploaded messages:
+
+| Message Type | Result | Action |
+|-------------|--------|--------|
+| **Call Message** (`💊 Kards Kollektors...`) | ✅ `SIGNAL_CALL` | Monitor + AI analyze |
+| **Update Message** (`Update: chimping out...`) | ✅ `UPDATE` | Log outcome |
+| **Bonding Message** (`Update: Kards...bonded`) | ✅ `PROMO` | Ignore |
+| **Announce Message** (`🟪 DIP MODE...`) | ✅ `PROMO` | Ignore |
+| **Recap Message** (`📣 VIP PUMPFUN Recap...`) | ✅ `PROMO` | Ignore |
+| **Ads Message** (`Renew 3 month...`) | ✅ `PROMO` | Ignore |
+
+## Deployment Steps
+
+1. Replace the 6 files in your repository
+2. Commit and push to GitHub
+3. Redeploy to Railway
+4. Monitor logs — you should see:
 ```
-
-Ikuti instruksi, masukkan kode verifikasi dari Telegram. Copy session string yang dihasilkan.
-
-### 5. Deploy ke Railway
-
-```bash
-# Install Railway CLI
-npm install -g @railway/cli
-
-# Login
-railway login
-
-# Buat project baru
-railway init
-
-# Deploy
-railway up
+[Listener] 📨 [SIGNAL_CALL] from @pumpfunnevadie
+[Listener] 🎯 SIGNAL_CALL detected! Processing...
+[Listener] 🆕 New call: KARDS (6FHc8u...) chain=sol
+[Listener] 🤖 Running initial AI analysis for KARDS...
+[Listener] 🧠 AI Prediction: PUMP | Confidence: 0.72
+[Listener] ✅ Initial prediction alert sent for KARDS
 ```
-
-### 6. Set Environment Variables di Railway
-
-Di Railway Dashboard → Variables, tambahkan:
-
-```
-TELEGRAM_API_ID=12345678
-TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
-TELEGRAM_PHONE=+628xxxxxxxxxx
-TELEGRAM_SESSION_STRING=<hasil dari generate_session.py>
-TELEGRAM_BOT_TOKEN=123456789:ABCdef...
-YOUR_CHAT_ID=123456789
-GROQ_API_KEY=gsk_...
-SIGNAL_CHANNELS=@channel1,@channel2,@channel3
-MONITOR_DURATION_MINUTES=60
-MIN_CONFIDENCE=0.65
-DB_PATH=data/memeagent.db
-PORT=8080
-```
-
----
-
-## 📱 Telegram Bot Commands
-
-| Command | Fungsi |
-|---|---|
-| `/status` | Winrate, total token, statistik |
-| `/tokens` | 10 token terakhir yang di-scan |
-| `/active` | Token yang sedang dipantau sekarang |
-| `/help` | Daftar commands |
-
----
-
-## 🔔 Jenis Notifikasi
-
-### 1. New Call Detected
-Saat call masuk dari channel signal, langsung dapat info:
-- Price, market cap, liquidity
-- Volume 5m, buy/sell ratio
-- Link DexScreener
-
-### 2. AI Prediction Alert
-Setelah 30 detik monitoring, AI kirim prediksi:
-- **PUMP / DUMP / RUG / CONSOLIDATE / ACCUMULATE**
-- Target multiplier (e.g., x3)
-- Safe TP (e.g., x2 untuk aman)
-- Stop loss %
-- Estimasi waktu ke peak
-- Confidence level
-- Key signals yang terdeteksi
-
-### 3. Pattern Learned
-Setelah sesi monitoring selesai (default 60 menit):
-- Pattern type yang dipelajari
-- Max gain yang terjadi
-- Disimpan ke database untuk meningkatkan akurasi
-
----
-
-## 🧠 Bagaimana AI Belajar
-
-1. Setiap token yang masuk → dipantau 60 menit
-2. Price snapshot setiap 5 detik (semua timeframe)
-3. Pattern disimpan ke SQLite dengan outcome (naik/turun/rug)
-4. Saat analyze token baru, AI dapat context dari 20 pattern terbaru sebagai few-shot examples
-5. Semakin banyak token → semakin akurat prediksi
-
----
-
-## 📊 Database Schema
-
-- `tokens` — Semua token yang pernah di-scan
-- `price_snapshots` — History harga per timeframe
-- `patterns` — Pola yang dipelajari per token
-- `predictions` — Prediksi AI dan hasilnya
-- `agent_stats` — Statistik agent
-
----
-
-## ⚠️ Penting
-
-- **Ini bukan financial advice**
-- Pastikan channel signal yang Anda pantau legal
-- Groq free tier limit: 14,400 req/hari, ~6,000 token/req
-- Jika banyak token masuk, turunkan frekuensi analisis
-- SQLite tidak persistent di Railway free tier → upgrade ke Hobby atau tambah volume
-
----
-
-## 🐛 Troubleshooting
-
-**Session expired**: Jalankan ulang `generate_session.py` dan update env var
-
-**Groq rate limit**: Tambah `MIN_CONFIDENCE` ke 0.8 untuk kurangi API calls
-
-**Token tidak terdeteksi**: Cek format channel di `SIGNAL_CHANNELS` (harus pakai @)
-
-**Database reset**: Railway free tier menghapus data saat redeploy → tambah persistent volume
