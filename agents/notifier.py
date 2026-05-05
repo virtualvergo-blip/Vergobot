@@ -4,6 +4,7 @@ Sends Telegram notifications via Bot API.
 Enhanced with GMGN security flags, candle data, and holder intel.
 """
 import os
+import html
 import asyncio
 import aiohttp
 from typing import Dict, Any, Optional
@@ -58,6 +59,7 @@ _send_message = _send
 async def send_new_call_alert(symbol: str, contract_address: str,
                                token_data: dict, source_channel: str):
     chain    = token_data.get("chain", "?").upper()
+    symbol = html.escape(str(symbol or "?"))
     price    = token_data.get("price_usd", 0)
     mcap     = token_data.get("market_cap", 0)
     liq      = token_data.get("liquidity_usd", 0)
@@ -108,6 +110,7 @@ async def send_new_call_alert(symbol: str, contract_address: str,
 async def send_prediction_alert(symbol: str, contract_address: str,
                                  token_data: dict, prediction: Dict[str, Any],
                                  timeframe_stats: Dict[str, Any]):
+    symbol = html.escape(str(symbol or "?"))
     pred_type  = prediction.get("prediction_type", "UNKNOWN")
     confidence = prediction.get("confidence", 0)
     pred_x     = prediction.get("predicted_multiplier", 1.0)
@@ -207,6 +210,7 @@ async def send_update_alert(
 async def send_pattern_learned_alert(symbol: str, contract_address: str,
                                       pattern_type: str, stats: Dict):
     max_gain = stats.get("max_gain_pct", 0)
+    symbol = html.escape(str(symbol or "?"))
     overall  = stats.get("overall_change_pct", 0)
     snaps    = stats.get("snapshots", 0)
     emoji    = "✅" if max_gain > 50 else ("⚠️" if max_gain > 20 else "❌")
