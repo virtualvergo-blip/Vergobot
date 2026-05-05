@@ -1,122 +1,109 @@
 """
 agents/bot_commands.py
-Handles Telegram bot commands from the user
+Telegram bot command handler via Bot API polling.
 """
 import os
 import asyncio
 import aiohttp
-import json
-from datetime import datetime, timezone
 from database.db_manager import get_winrate_stats, get_recent_tokens
-from agents.token_monitor import get_active_count, active_monitors
-from agents.notifier import send_status_message, _send_message
+from agents.token_monitor import active_monitors
+from agents.notifier import send_status_message
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-YOUR_CHAT_ID = str(os.getenv("YOUR_CHAT_ID", ""))
-
-HELP_TEXT = """🤖 <b>MEME AGENT COMMANDS</b>
-
-/status — Agent stats, winrate, DB size
-/tokens — Last 10 scanned tokens  
-/active — Currently monitoring tokens
-/help — This message
-
-<i>Agent auto-notifies on every call from signal channels.</i>"""
-
-
-async def handle_update(update: dict):
-    """Process incoming Telegram bot update"""
-    message = update.get("message", {})
-    if not message:
-        return
-    
-    chat_id = str(message.get("chat", {}).get("id", ""))
-    text = message.get("text", "")
-    
-    # Security: only respond to owner
-    if chat_id != YOUR_CHAT_ID:
-        return
-    
-    if not text.startswith("/"):
-        return
-    
-    command = text.split()[0].lower()
-    
-    if command == "/status":
-        stats = await get_winrate_stats()
-        active_count = get_active_count()
-        await send_status_message(stats, active_count)
-    
-    elif command == "/tokens":
-        tokens = await get_recent_tokens(limit=10)
-        if not tokens:
-            await _send_message("📭 No tokens in database yet.")
-            return
-        
-        lines = ["📋 <b>RECENT TOKENS</b>\n"]
-        for i, t in enumerate(tokens, 1):
-            pred = t.get("last_prediction", "—")
-            conf = t.get("last_confidence", 0)
-            conf_pct = f"{round((conf or 0) * 100)}%" if conf else "—"
-            lines.append(
-                f"{i}. <b>{t.get('symbol', '?')}</b> [{t.get('chain', '?').upper()}]\n"
-                f"   Prediction: {pred} ({conf_pct})\n"
-                f"   Seen: {t.get('first_seen_at', '?')[:16]}\n"
-            )
-        
-        await _send_message("\n".join(lines))
-    
-    elif command == "/active":
-        if not active_monitors:
-            await _send_message("😴 No tokens currently being monitored.")
-            return
-        
-        lines = [f"🔴 <b>ACTIVE MONITORS ({len(active_monitors)})</b>\n"]
-        for addr, info in active_monitors.items():
-            elapsed = (datetime.now(timezone.utc) - info["start_time"]).seconds // 60
-            lines.append(
-                f"• <b>{info.get('symbol', addr[:8])}</b>\n"
-                f"  Running: {elapsed}m | Snapshots: {info.get('snapshots', 0)}\n"
-            )
-        
-        await _send_message("\n".join(lines))
-    
-    elif command == "/help":
-        await _send_message(HELP_TEXT)
-
 
 async def start_polling():
-    """Start bot polling for commands"""
+    """Start bot command polling via Telegram Bot API."""
     if not BOT_TOKEN:
-        print("[Bot] No BOT_TOKEN configured, commands disabled")
+        print("[Bot] No BOT_TOKEN configured, skipping command polling")
         return
-    
-    offset = 0
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}"
-    
+
     print("[Bot] Starting command polling...")
-    
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(
-                    f"{url}/getUpdates",
-                    params={"offset": offset, "timeout": 30, "limit": 10},
-                    timeout=aiohttp.ClientTimeout(total=35)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        updates = data.get("result", [])
-                        
-                        for update in updates:
-                            offset = update["update_id"] + 1
-                            try:
-                                await handle_update(update)
-                            except Exception as e:
-                                print(f"[Bot] Update handler error: {e}")
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[Bot] Polling error: {e}")
-                await asyncio.sleep(5)
+    offset = 0
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&limit=10"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        await asyncio.sleep(5)
+                        continue
+
+                    data = await resp.json()
+                    if not data.get("ok"):
+                        await asyncio.sleep(5)
+                        continue
+
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        await _handle_update(update)
+
+        except Exception as e:
+            print(f"[Bot] Polling error: {e}")
+            await asyncio.sleep(5)
+
+async def _handle_update(update: dict):
+    """Handle a single update from Bot API."""
+    message = update.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id")
+
+    if not text or not chat_id:
+        return
+
+    if text.startswith("/status"):
+        stats = await get_winrate_stats()
+        from agents.token_monitor import get_active_count
+        await send_status_message(stats, get_active_count())
+
+    elif text.startswith("/tokens"):
+        tokens = await get_recent_tokens(10)
+        msg = "📊 <b>Recent Tokens:</b>\n\n"
+        for t in tokens:
+            sym = t.get('symbol', '?')
+            ca = t.get('contract_address', '?')
+            pred = t.get('last_prediction', 'N/A')
+            conf = t.get('last_confidence', 0)
+            conf_str = f"{conf*100:.0f}%" if conf else "N/A"
+            msg += f"• <b>{sym}</b> | <code>{ca[:10]}...</code> | {pred} ({conf_str})\n"
+        await _send_bot_message(chat_id, msg)
+
+    elif text.startswith("/active"):
+        if not active_monitors:
+            await _send_bot_message(chat_id, "🔴 <b>No active monitors</b>")
+        else:
+            msg = "🔴 <b>Active Monitors:</b>\n\n"
+            for addr, info in active_monitors.items():
+                sym = info.get('symbol', '?')
+                entry = info.get('entry_price', 0)
+                snaps = info.get('snapshots', 0)
+                msg += f"• <b>{sym}</b> | Entry: ${entry:.8f} | Snaps: {snaps}\n"
+            await _send_bot_message(chat_id, msg)
+
+    elif text.startswith("/help"):
+        msg = (
+            "🤖 <b>Meme Coin AI Agent Commands:</b>\n\n"
+            "/status — Agent statistics & performance\n"
+            "/tokens — Recent scanned tokens\n"
+            "/active — Currently monitoring tokens\n"
+            "/help — This message"
+        )
+        await _send_bot_message(chat_id, msg)
+
+async def _send_bot_message(chat_id: int, text: str):
+    import aiohttp
+    url = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    print(f"[Bot] Send failed {resp.status}: {err[:100]}")
+    except Exception as e:
+        print(f"[Bot] Send failed: {e}")
