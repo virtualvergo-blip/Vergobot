@@ -73,6 +73,10 @@ async def start_listener(client: TelegramClient):
             src     = "@" + ch_name
 
             msg_type = classify_message(text)
+
+            # Hanya proses SIGNAL_CALL — UPDATE dan PROMO diabaikan.
+            if msg_type.value != "SIGNAL_CALL":
+                return
             print("\n[Listener] [" + msg_type.value + "] from " + src + ": " + text[:60].strip() + "...")
 
             if msg_type == MessageType.SIGNAL_CALL:
